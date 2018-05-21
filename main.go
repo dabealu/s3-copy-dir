@@ -9,6 +9,8 @@ import (
 	"log"
 	"os"
 	"time"
+	"sync"
+	"strconv"
 )
 
 func logFatal(err error) {
@@ -68,6 +70,21 @@ func printExampleConf() {
 	fmt.Println(string(b))
 }
 
+// struct to track progress
+type objCounter struct {
+	sync.Mutex
+	Total	int64
+	Current	int64
+}
+
+func (oc *objCounter) increment() {
+	oc.Current++
+}
+
+func (oc *objCounter) getCurrent() int64 {
+	return oc.Current
+}
+
 // load configuration file
 func loadConfig(path string, conf *config) {
 	file, err := os.Open(path)
@@ -78,8 +95,39 @@ func loadConfig(path string, conf *config) {
 	logFatal(err)
 }
 
+// count objects in a dir to show progress during copying
+func countDirObjects(src *minio.Client, bucket, dir string) int64 {
+	log.Printf("starting counting objects in '%s/%s'", bucket, dir)
+
+	var count int64
+
+	// print objects count periodically
+	stopCh := make(chan struct{})
+	go func(c *int64) {
+		for {
+			select {
+			case <- stopCh:
+				close(stopCh)
+				return
+			default:
+				log.Printf("still counting objects: %d ...", *c)
+				time.Sleep(time.Second * 5)
+			}
+		}
+	}(&count)
+
+	objCh := src.ListObjects(bucket, dir, true, make(chan struct{}))
+	for _ = range objCh {
+		count++
+	}
+	stopCh <- struct{}{}
+
+	log.Printf("total objects in '%s/%s': %d", bucket, dir, count)
+	return count
+}
+
 // copy object from source to destination, skip if object already exists in destination
-func copyObj(src, dst *minio.Client, bucket, objPath string, workersCh chan struct{}) {
+func copyObj(src, dst *minio.Client, bucket, objPath string, workersCh chan struct{}, oc *objCounter) {
 	defer func(ch chan struct{}) { <-ch }(workersCh)
 
 	srcObj, err := src.GetObject(bucket, objPath, minio.GetObjectOptions{})
@@ -87,23 +135,38 @@ func copyObj(src, dst *minio.Client, bucket, objPath string, workersCh chan stru
 
 	// check and skip if object already exists in dest
 	dstObjStat, _ := dst.StatObject(bucket, objPath, minio.StatObjectOptions{})
+
+	// copy
+	size, err := dst.PutObject(bucket, objPath, srcObj, -1, minio.PutObjectOptions{})
+
+	// check results
+	oc.Lock()
+	defer oc.Unlock()
+
+	total := ""
+	if oc.Total != -1 {
+		total = "/" + strconv.FormatInt(oc.Total, 10)
+	}
+
 	if dstObjStat.Key != "" {
-		log.Printf("skipping '%s/%s', already exists in destination", bucket, objPath)
+		log.Printf("[%d%s] skipping '%s/%s', already exists in destination", oc.getCurrent(), total, bucket, objPath)
 		return
 	}
 
-	// copy
-	if size, err := dst.PutObject(bucket, objPath, srcObj, -1, minio.PutObjectOptions{}); err != nil {
-		log.Printf("ERROR copying '%s/%s': %s", bucket, objPath, err)
+	if err != nil {
+		log.Printf("[%d%s] ERROR copying '%s/%s': %s", oc.getCurrent(), total, bucket, objPath, err)
 	} else {
-		log.Printf("copied '%s/%s', %d bytes", bucket, objPath, size)
+		log.Printf("[%d%s] copied '%s/%s', %d bytes", oc.getCurrent(), total, bucket, objPath, size)
 	}
+
+	oc.increment()
 }
 
 func main() {
 	// parse flags and load config
 	confPath := flag.String("config", "config.json", "location of config file")
 	confSample := flag.Bool("sample", false, "print sample config and exit")
+	showProgress := flag.Bool("progress", false, "show progress estimation, it requires to count objects before copying")
 	flag.Parse()
 
 	if *confSample {
@@ -126,6 +189,14 @@ func main() {
 	dst, err := minio.New(c.Destination.Endpoint, c.Destination.AccessKey, c.Destination.SecretKey, c.Destination.SSL)
 	logFatal(err)
 
+	// count objects in source dir, if enabled
+	oc := &objCounter{}
+	if *showProgress {
+		oc.Total = countDirObjects(src, c.options.Bucket, c.options.Directory)
+	} else {
+		oc.Total = -1
+	}
+
 	doneCh := make(chan struct{})
 	recursive := true
 	// channel with stream of objects (<-chan ObjectInfo)
@@ -135,7 +206,10 @@ func main() {
 	workersCh := make(chan struct{}, c.options.Concurrency)
 	for obj := range objCh {
 		workersCh <- struct{}{}
-		go copyObj(src, dst, c.options.Bucket, obj.Key, workersCh)
+		///////////
+		fmt.Println("oc.getCurrent() inside copy:", oc.getCurrent())
+		///////////
+		go copyObj(src, dst, c.options.Bucket, obj.Key, workersCh, oc)
 	}
 
 	// wait untill all workers completed and exit

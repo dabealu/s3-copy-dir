@@ -8,9 +8,9 @@ import (
 	"io/ioutil"
 	"log"
 	"os"
-	"time"
-	"sync"
 	"strconv"
+	"sync"
+	"time"
 )
 
 func logFatal(err error) {
@@ -73,8 +73,8 @@ func printExampleConf() {
 // struct to track progress
 type objCounter struct {
 	sync.Mutex
-	Total	int64
-	Current	int64
+	Total   int64
+	Current int64
 }
 
 func (oc *objCounter) increment() {
@@ -106,7 +106,7 @@ func countDirObjects(src *minio.Client, bucket, dir string) int64 {
 	go func(c *int64) {
 		for {
 			select {
-			case <- stopCh:
+			case <-stopCh:
 				close(stopCh)
 				return
 			default:
@@ -143,6 +143,8 @@ func copyObj(src, dst *minio.Client, bucket, objPath string, workersCh chan stru
 	oc.Lock()
 	defer oc.Unlock()
 
+	oc.increment()
+
 	total := ""
 	if oc.Total != -1 {
 		total = "/" + strconv.FormatInt(oc.Total, 10)
@@ -158,8 +160,6 @@ func copyObj(src, dst *minio.Client, bucket, objPath string, workersCh chan stru
 	} else {
 		log.Printf("[%d%s] copied '%s/%s', %d bytes", oc.getCurrent(), total, bucket, objPath, size)
 	}
-
-	oc.increment()
 }
 
 func main() {
@@ -206,9 +206,6 @@ func main() {
 	workersCh := make(chan struct{}, c.options.Concurrency)
 	for obj := range objCh {
 		workersCh <- struct{}{}
-		///////////
-		fmt.Println("oc.getCurrent() inside copy:", oc.getCurrent())
-		///////////
 		go copyObj(src, dst, c.options.Bucket, obj.Key, workersCh, oc)
 	}
 
